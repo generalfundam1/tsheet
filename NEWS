@@ -1,0 +1,118 @@
+tsheet alpha1
+============
+
+Export and import
+- Export: XLSX and ODS are in the Export menu.
+- File > Export options: delimiter (comma, semicolon, tab, pipe), CRLF line
+  endings, and "Selection only", which saves just the selected block.
+- File > Import options: delimiter used when opening CSV files.
+- Writers stay libc-only: a small stored-zip writer builds XLSX and ODS.
+
+Clipboard
+- Tab-separated paste trims spaces around each field; blank fields become
+  empty cells. HTML paste already collapsed whitespace.
+
+Menus
+- Hovering over a title in the menu bar highlights it, and opens its pop-up
+  when there is one (Graph opens its dialog on click only).
+- Graph menu is a pop-up list: draw, view, and all graph options.
+- Graph > View in gnuplot window opens the graph in gnuplot's own window
+  (gnuplot -persist), instead of rendering a PDF.
+
+Program
+- Program is named tsheet (make installs tsheet). --version prints it.
+
+Copy and paste
+- With-formatting copies put the displayed text on the clipboard as well as the
+  HTML, so a plain-text paste shows what the cells show.
+- HTML copies keep bold, highlight and alignment; LaTeX copies do too
+  (\\textbf, \\colorbox) and escape the prefix and suffix.
+- Pasting from another book (HTML or text) keeps the formats it can read: bold
+  weight, a background that is not white (highlight), text alignment, and numbers
+  with a prefix or suffix. "$1,234.50" becomes 1234.50 with a $ prefix, comma
+  grouping and two decimals; "12 kg" becomes 12 with the suffix " kg"; "25%" is
+  25 with the suffix "%"; "(1,234)" is -1234 (shown with a minus sign). Text that
+  only looks numeric ("Room 12", "3 apples 4") stays text.
+- Pasted cells take the source's format, and plain text clears it, as a paste
+  from another book does.
+
+Convert
+- Convert menu (top bar): To unit... converts the selection to a unit; type
+  "ft", or "m ft" when the plain numbers are metres. Then 13 categories of
+  common scientific conversions (70 pairs): length, mass, time, volume, area,
+  pressure, energy, power, force, speed, temperature, angle, frequency. Each
+  item shows its factor in the status bar.
+- A cell with a unit as its suffix converts from that unit; a plain number takes
+  the item's "from" unit. A formula stays a formula, =(x)*a+b, unless it reads a
+  cell of the selection (it then follows that cell). Quantities of another kind
+  are left alone. Temperatures use their offsets (°C, °F, K, °R).
+- Limits: a formula's reference is not rewritten; a range that spans the selection
+  with both ends outside it counts as outside.
+
+Spreadsheet files
+- Open reads .xlsx and .ods (first sheet). Shared strings, numbers, booleans,
+  formulas (kept as formulas), merged cells, repeated and spanned cells, and
+  text spacing are read. Zip and deflate are built in (read.c), no libraries.
+- XLSX and ODS save now record merged blocks (mergeCells, spans), and write only
+  the top-left cell's value into a merged block.
+- Limits: formulas are read as written (references converted); charts, styles,
+  column widths and other sheets are not read; a file longer than 10000 rows is
+  cut at that row.
+
+Numbers
+- Format > Prefix... and Suffix... set text shown before and after numbers. Both
+  take UTF-8 (€, kg, %) or LaTeX (\\euro, \\text{kg}, m^{2}, H_{2}O); LaTeX is
+  shown as UTF-8. Text cells are not changed. Empty clears.
+- Format > Numbers: Plain, Comma 1,000 (1,234.5), Space 1 000, Scientific
+  1*10^3 (1.234*10^3, 0.5*10^-3), Engineering 1 k (1.234 k, k to E; under 1000
+  shown plain). These apply to whole and decimal numbers; decimal places still
+  apply with grouping.
+- A suffix after an engineering number gets its own word: 1.234 k kg.
+
+Format, warnings and colours
+- Format is a hover pop-up. An option shows * when the whole selection has it:
+  bold, highlight, alignment, date format and decimal places.
+  Choosing an option applies it to the whole selection. If only some cells have
+  it, choosing it applies it to all of them; if all have it, it is removed. This
+  is the rule for every format option: bold, highlight, alignment, date format,
+  decimal places and integer styles.
+  Bold, highlight and highlighting stay visible while a block is selected.
+  A range formats every cell in it, including empty cells past the data. A whole
+  column or row formats up to the last used row or column only.
+- Bold, highlight, date format and decimal places toggle across the selection:
+  removed when every cell has them, added to every cell otherwise. Date and
+  decimal places ask for a format when they are added.
+- Highlighted cells have dark text on the yellow.
+- Hovering a menu bar title uses the same colours as an open menu, Graph included.
+- Closing or quitting a sheet that is not saved or exported warns in red. Saving
+  or exporting (any format, or a selection) clears the warning. Undo, redo and
+  resizing a column or row count as changes.
+
+Import, export and menus
+- File > Import... and File > Export... open dialogs like the Graph options:
+  each row has a description, the current settings show as [*], and choosing a
+  delimiter or toggle updates the list in place.
+- Graph in the menu bar opens the all-options dialog directly. The right-click
+  Graph menu keeps its quick items.
+- Space delimited text, for import and export (Delimiter: space). On import a
+  run of spaces is one separator and blank ends are ignored; quoted fields keep
+  their spaces. On export a blank cell is written as "" so columns line up.
+- Opening a file with no known extension uses the import delimiter.
+- The File menu keeps New, Open, Find, Save, Import..., Export..., Close and Quit.
+
+Selection
+- Ctrl+click adds an area, as in Excel; drag with Ctrl to grow the new one.
+  Ctrl+click on a selected cell unselects it, even inside a larger area: the
+  area is split around it. Ctrl+click on a lit column or row header unselects
+  that column or row. The corner where the headers meet selects the used range.
+  At least one cell always stays selected.
+  Plain clicks, arrows and Esc drop the areas; Shift+click extends the active one.
+- Clear, format and the status bar (count, sum, average) work on every area;
+  a cell in two areas counts once. Copy, cut, paste, fill, sort, merge, graph
+  and selection-only export need one area and say so.
+- Column and row headers: Ctrl+click adds a whole column or row.
+- Clearing skips empty cells: clearing a 7-million-cell extent is about 13
+  times faster and records about 270 times fewer undo entries.
+
+Earlier
+- Sort ascending/descending on the selection, Go to cell (Ctrl+G).
