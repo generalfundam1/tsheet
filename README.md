@@ -1,6 +1,6 @@
 # tsheet
 
-A spreadsheet for the linux terminal. Mouse first, Excel-style: click, drag, Ctrl-click
+A spreadsheet for the linux terminal. Excel-like: click, drag, etc.
 to select several areas, and menus that open on hover. Written in C with the C library only; the X11 clipboard is used when the
 X11 headers are installed, and otherwise the terminal's OSC 52 clipboard is used.
 
