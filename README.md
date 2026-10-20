@@ -66,4 +66,4 @@ Menus are data in `config.h`: add an item there and give it an action in `app.c`
 
 ## Licence
 
-To be decided (see LICENSE).
+GNU General Public License, version 2
