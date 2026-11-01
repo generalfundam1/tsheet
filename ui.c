@@ -359,6 +359,9 @@ static void draw_grid(const App *a) {
                 skip = a->epos > w - 1 ? a->epos - (w - 1) : 0;
             } else {
                 cell_display(d->g, r, c, buf, sizeof buf, &align);
+                double nv;
+                if (kind != KIND_TIME && cell_num(d->g, r, c, 0, &nv) == 0)
+                    num_fit(buf, sizeof buf, w, nv);       /* never cut digits off a number */
                 text = buf;
             }
             int len = u8len(text + skip);
@@ -561,11 +564,14 @@ static void draw_dlg(const App *a) {
     int applied = 0;
     for (int i = 0; i < a->ndlg; i++) applied += a->dlg[i].inv;
     char title[96];
-    if (a->acts) snprintf(title, sizeof title, " %s   Enter applies, Esc closes ", a->acts_title);
+    int asking = a->acts && a->npend;          /* the delimiter prompt of a file being opened */
+    if (asking) snprintf(title, sizeof title, " %.90s ", a->acts_title);
+    else if (a->acts) snprintf(title, sizeof title, " %s   Enter applies, Esc closes ", a->acts_title);
     else if (a->dlg_kind == DLGK_MAIN) snprintf(title, sizeof title, " Graph options   %d applied ", applied);
     else snprintf(title, sizeof title, " %s   choose a value ", graph_opts[a->dlg_opt].name);
     puts_at(y, x + 2, title, AT_MENU, w - 4);
-    puts_at(y + 1, x + 2, a->acts ? "Enter/Space runs it   Esc closes   [*] = on"
+    puts_at(y + 1, x + 2, asking ? "Enter/Space opens the file with it   Esc cancels   [*] = detected"
+                          : a->acts ? "Enter/Space runs it   Esc closes   [*] = on"
                                   : "Enter/Space sets   Esc goes back   inverted = applied",
             AT_MENU, w - 4);
 

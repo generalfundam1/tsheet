@@ -283,6 +283,84 @@ static int formula_eval(const Sheet *s, const char *expr, int depth, double *out
 
 static void skip_ws(Parser *P) { while (*P->p == ' ' || *P->p == '\t') P->p++; }
 
+/* strtod that also reads Fortran exponents: 1.5D+03, 1.d2, 2.0Q-5 (D or Q
+   instead of E, any case). *end is set as strtod sets it. */
+static double strtod_f(const char *s, char **end) {
+    double v = strtod(s, end);
+    const char *e = *end;
+    if (e == s || !*e || !strchr("dDqQ", *e)) return v;     /* strchr would match the NUL */
+    const char *x = e + 1;
+    if (*x == '+' || *x == '-') x++;
+    if (!isdigit((unsigned char)*x)) return v;
+    while (isdigit((unsigned char)*x)) x++;
+    char buf[160];
+    size_t ml = (size_t)(e - s), xl = (size_t)(x - e - 1);
+    if (ml + xl + 2 > sizeof buf) return v;
+    memcpy(buf, s, ml);
+    buf[ml] = 'e';
+    memcpy(buf + ml + 1, e + 1, xl);
+    buf[ml + 1 + xl] = '\0';
+    char *be;
+    double w = strtod(buf, &be);
+    if (*be) return v;
+    *end = (char *)x;
+    return w;
+}
+
+/* A whole cell text as a number: what strtod reads, Fortran exponents (above),
+   and Fortran's E-less form for three-digit exponents, 1.234567-100 (it needs
+   the decimal point). Blanks around the number are allowed. 0 when not a number. */
+int num_read(const char *raw, double *out) {
+    const char *p = raw;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!(isdigit((unsigned char)p[0]) || p[0] == '-' || p[0] == '+' || p[0] == '.')) return 0;
+    char *end;
+    double v = strtod_f(p, &end);
+    if (end == p) return 0;
+    const char *t = end;
+    if ((*t == '+' || *t == '-') && memchr(p, '.', (size_t)(t - p)) && !strpbrk(p, "eEdDqQ") &&
+        isdigit((unsigned char)t[1]) && isdigit((unsigned char)t[2]) && isdigit((unsigned char)t[3])) {
+        const char *x = t + 4;
+        while (*x == ' ' || *x == '\t') x++;
+        if (!*x && !isdigit((unsigned char)t[4])) {
+            char buf[160];
+            size_t ml = (size_t)(t - p);
+            if (ml + 6 > sizeof buf) return 0;
+            memcpy(buf, p, ml);
+            buf[ml] = 'e';
+            memcpy(buf + ml + 1, t, 4);
+            buf[ml + 5] = '\0';
+            char *be;
+            double w = strtod(buf, &be);
+            if (*be) return 0;
+            *out = w;
+            return 1;
+        }
+    }
+    while (*t == ' ' || *t == '\t') t++;
+    if (*t) return 0;
+    *out = v;
+    return 1;
+}
+
+/* Is the text a number in Fortran form (a D or Q exponent, or the E-less
+   1.234-100)? Then body gets the Fortran number format, its decimals taken from
+   the mantissa (more than 9: as many as needed). 0 for any other text. */
+int num_fortran_fmt(const char *text, char *body, size_t n) {
+    double v;
+    if (!text || !num_read(text, &v)) return 0;
+    const char *p = text;
+    while (*p == ' ' || *p == '\t') p++;
+    const char *x = strpbrk(p, "dDqQ");
+    if (!x && (strpbrk(p, "eE") || !strpbrk(p + 1, "+-"))) return 0;
+    if (!x) x = strpbrk(p + 1, "+-");                      /* E-less: the exponent sign */
+    const char *dot = memchr(p, '.', (size_t)(x - p));
+    int dec = dot ? (int)(x - dot - 1) : 0;
+    NumSpec ns = {'D', dec <= 9 ? dec : -1, "", ""};
+    num_build(body, n, &ns);
+    return 1;
+}
+
 int cell_num(const Sheet *s, int r, int c, int depth, double *out) {
     const char *raw = sheet_get(s, r, c);
     *out = 0;
@@ -291,13 +369,7 @@ int cell_num(const Sheet *s, int r, int c, int depth, double *out) {
         if (formula_eval(s, raw + 1, depth + 1, out) < 0) return 2;
         return 0;
     }
-    if (!(isdigit((unsigned char)raw[0]) || raw[0] == '-' || raw[0] == '+' || raw[0] == '.'))
-        return 1;
-    char *end;
-    double v = strtod(raw, &end);
-    if (end == raw || *end) return 1;
-    *out = v;
-    return 0;
+    return num_read(raw, out) ? 0 : 1;
 }
 
 static double cell_value(Parser *P, int r, int c) {
@@ -370,7 +442,7 @@ static double parse_factor(Parser *P) {
     }
     if (isdigit(c) || c == '.') {
         char *end;
-        double v = strtod(P->p, &end);
+        double v = strtod_f(P->p, &end);                /* 1.5D3 in a formula too */
         if (end == P->p) { P->err = 1; return 0; }
         P->p = end;
         return v;
@@ -542,6 +614,60 @@ static void style_text(char *out, size_t n, int style, double v, int dec) {
     else snprintf(out, n, "%s%s", sign, grp);
 }
 
+/* Fortran double precision: 1.5D+03. dec >= 0 fixes the mantissa's decimals;
+   otherwise the fewest (at least one) that give the value back exactly. */
+static void fortran_text(char *out, size_t n, double v, int dec) {
+    char b[64];
+    if (dec >= 0) snprintf(b, sizeof b, "%#.*E", dec, v);
+    else {
+        for (int p = 1; p <= 17; p++) {
+            snprintf(b, sizeof b, "%.*E", p, v);
+            if (strtod(b, NULL) == v) break;
+        }
+    }
+    char *e = strchr(b, 'E');
+    if (e) *e = 'D';
+    snprintf(out, n, "%s", b);
+}
+
+static int u8cols(const char *s) {
+    int k = 0;
+    for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) k++;
+    return k;
+}
+
+/* Fits the display text of number v into w columns. Blanks around it go first.
+   A plain number that is still too wide is written with fewer digits, rounded,
+   its exponent kept (a Fortran D stays a D, 1.2500000000000000D-03 becomes
+   1.2500D-03); a formatted one, or one that cannot fit, becomes #### as in
+   other spreadsheets. Cutting digits off would show a different number. */
+void num_fit(char *t, size_t n, int w, double v) {
+    size_t a = 0, l = strlen(t);
+    while (t[a] == ' ' || t[a] == '\t') a++;
+    while (l > a && (t[l - 1] == ' ' || t[l - 1] == '\t')) l--;
+    memmove(t, t + a, l - a);
+    t[l - a] = '\0';
+    if (w < 1 || u8cols(t) <= w) return;
+    double chk;
+    if (num_read(t, &chk)) {                       /* digits only: shorten it */
+        /* Fortran text: a D or Q exponent, or the E-less 1.234-100 */
+        int fort = strpbrk(t, "dDqQ") || (!strpbrk(t, "eE") && strpbrk(t + 1, "+-"));
+        char b[64];
+        for (int p = 16; p >= 0; p--) {
+            if (fort) fortran_text(b, sizeof b, v, p);
+            else snprintf(b, sizeof b, "%.*g", p ? p : 1, v);
+            if ((int)strlen(b) <= w) { snprintf(t, n, "%s", b); return; }
+        }
+        for (int p = 16; p >= 0 && !fort; p--) {
+            snprintf(b, sizeof b, "%.*e", p, v);
+            if ((int)strlen(b) <= w) { snprintf(t, n, "%s", b); return; }
+        }
+    }
+    int k = 0;
+    for (; k < w && (size_t)k + 1 < n; k++) t[k] = '#';
+    t[k] = '\0';
+}
+
 /* ---- LaTeX to UTF-8 for prefixes and suffixes. UTF-8 input passes through. ---- */
 
 static const struct { const char *name; const char *u8; } ltx_sym[] = {
@@ -647,6 +773,11 @@ void latex_to_utf8(const char *in, char *out, size_t n) {
     }
 }
 
+static int fortran_form(const char *raw) {
+    char b[64];
+    return num_fortran_fmt(raw, b, sizeof b);
+}
+
 /* One number as text. Whole numbers take the integer styles; other numbers keep
    their decimals (or as typed). The prefix and suffix wrap the number. */
 static void numeric_text(const NumSpec *ns, const char *raw, int formula, double v,
@@ -654,8 +785,21 @@ static void numeric_text(const NumSpec *ns, const char *raw, int formula, double
     char core[512];
     if (ns->style == ',' || ns->style == ' ' || ns->style == 'e' || ns->style == 'g')
         style_text(core, sizeof core, ns->style, v, ns->dec);
+    else if (ns->style == 'D') fortran_text(core, sizeof core, v, ns->dec);
     else if (ns->dec >= 0) snprintf(core, sizeof core, "%.*f", ns->dec, v);
     else if (formula) snprintf(core, sizeof core, "%.10g", v);
+    else if (fortran_form(raw)) {
+        /* written the Fortran way but not formatted so (Plain): an ordinary number,
+           the fewest digits that give the value back */
+        int p = 1;
+        for (; p < 17; p++) {
+            snprintf(core, sizeof core, "%.*e", p - 1, v);
+            if (strtod(core, NULL) == v) break;
+        }
+        int ex = atoi(strchr(core, 'e') + 1);
+        if (ex >= -5 && ex < 15) snprintf(core, sizeof core, "%.*f", p - 1 - ex > 0 ? p - 1 - ex : 0, v);
+        else snprintf(core, sizeof core, "%.*g", p, v);   /* very large or small: 1e+300 */
+    }
     else snprintf(core, sizeof core, "%s", raw);
     char pre[200], suf[200];
     latex_to_utf8(ns->pre, pre, sizeof pre);

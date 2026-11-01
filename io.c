@@ -88,6 +88,82 @@ int io_fmt_from_text(const char *b, size_t n) {
     return memchr(b + i, '\t', e - i) ? FMT_TSV : FMT_CSV;
 }
 
+/* Guesses the field delimiter of delimited text. Up to 200 lines are sampled;
+   for each candidate the count of delimiters outside quotes is taken per line.
+   The winner is the candidate whose most common nonzero count is shared by the
+   largest share of lines. Ties go to the candidate that rarely occurs inside
+   data: tab, then semicolon, then pipe, then comma (so "1,5;2,7" is semicolon
+   data with decimal commas). Spaces (runs count once, line ends ignored) are
+   used only when no other candidate is on at least half of the lines.
+   sure (optional) is set when there are two or more lines and every one of
+   them has the same nonzero count: the text is plainly a table. */
+#define DET_LINES 200
+int io_detect_delim(const char *b, size_t n, int *sure) {
+    static const char cand[] = {'\t', ';', '|', ',', ' '};
+    enum { NC = sizeof cand };
+    static int cnt[NC][DET_LINES];
+    int nl = 0;
+    if (sure) *sure = 0;
+    size_t i = 0;
+    if (n >= 3 && !memcmp(b, "\xEF\xBB\xBF", 3)) i = 3;
+    while (i < n && nl < DET_LINES) {
+        int k[NC] = {0}, inq = 0, blank = 1, sp_run = 0, sp_pend = 0;
+        for (; i < n; i++) {
+            char ch = b[i];
+            if (!inq && (ch == '\n' || ch == '\r')) break;
+            if (ch == '"') {
+                if (!inq && sp_run && !blank) k[NC - 1] += sp_pend;
+                sp_pend = sp_run = 0;
+                inq = !inq;
+                blank = 0;
+                continue;
+            }
+            if (inq) continue;
+            if (ch == ' ') {
+                if (!blank && !sp_run) sp_pend++;    /* counted when text follows */
+                sp_run = 1;
+                continue;
+            }
+            if (sp_run && !blank) k[NC - 1] += sp_pend;
+            sp_pend = 0;
+            sp_run = 0;
+            if (ch != '\t') blank = 0;
+            for (int c = 0; c < NC - 1; c++)
+                if (ch == cand[c]) { k[c]++; blank = 0; }
+        }
+        if (i < n && b[i] == '\r') i++;
+        if (i < n && b[i] == '\n') i++;
+        if (blank) continue;                         /* empty lines say nothing */
+        for (int c = 0; c < NC; c++) cnt[c][nl] = k[c];
+        nl++;
+    }
+    if (!nl) return ',';
+    int best = -1, best_mode = 0;
+    double best_share = 0;
+    double share[NC];
+    int mode[NC];
+    for (int c = 0; c < NC; c++) {
+        /* most common nonzero count, and the share of lines that have it */
+        int m = 0, mf = 0;
+        for (int x = 0; x < nl; x++) {
+            int v = cnt[c][x], f = 0;
+            if (!v || v == m) continue;
+            for (int y = 0; y < nl; y++) f += cnt[c][y] == v;
+            if (f > mf || (f == mf && v > m)) { m = v; mf = f; }
+        }
+        mode[c] = m;
+        share[c] = (double)mf / nl;
+    }
+    for (int c = 0; c < NC - 1; c++)
+        if (mode[c] && share[c] > best_share + 1e-9) { best = c; best_share = share[c]; best_mode = mode[c]; }
+    if (best < 0 || best_share < 0.5) {
+        if (mode[NC - 1] && share[NC - 1] > best_share) { best = NC - 1; best_mode = mode[NC - 1]; best_share = share[NC - 1]; }
+    }
+    if (best < 0) return ',';
+    if (sure) *sure = nl >= 2 && best_share > 1 - 1e-9 && best_mode > 0;
+    return cand[best];
+}
+
 /* "AB12" -> 0-based row/col. */
 static int parse_ref(const char *s, int *r, int *c) {
     int col = 0, row = 0, n = 0;
@@ -120,6 +196,8 @@ static int commit(Sheet *g, Buf *f, int r, int c) {
     if (r >= MAX_ROWS || c >= MAX_COLS) return -1;
     bputc(f, '\0');
     sheet_set(g, r, c, f->s);
+    char body[64];
+    if (num_fortran_fmt(f->s, body, sizeof body)) sheet_fmt_set(g, r, c, body);   /* 1.d2 shows as Fortran */
     f->n = 0;
     return 0;
 }

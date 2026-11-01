@@ -119,11 +119,131 @@ static void doc_new(App *a) {
 }
 
 static void load_path_do(App *a, const char *path);
+static const char *delim_name(int c);
+static int act_delim(int act);
+static void graph_raw_prompt(App *a, const char *label);
 
 static void load_path(App *a, const char *path) {
     Txn *paused = txn_pause();
     load_path_do(a, path);
     txn_resume(paused);
+}
+
+/* Parses a file's text into a new sheet. Takes buf. how: 0 a fixed format,
+   1 the delimiter from Import, 2 detected, 3 picked in the open prompt. */
+static void open_buf(App *a, const char *path, char *buf, size_t len, int fmt, int delim, int how) {
+    Sheet *g = sheet_new();
+    char err[256];
+    if (!g || io_parse_delim(g, buf, len, fmt, delim, err, sizeof err) < 0) {
+        snprintf(a->msg, sizeof a->msg, "%.100s: %.140s", path, err);
+        a->warn = 1;
+        sheet_free(g);
+        free(buf);
+        return;
+    }
+    free(buf);
+    /* the empty sheet made at start-up gives way to the first file opened */
+    if (a->placeholder >= 0 && a->placeholder < a->ndocs) {
+        Doc *p = &a->docs[a->placeholder];
+        if (!p->dirty && !p->path && p->g->max_r == 0 && p->g->max_c == 0 && !sheet_get(p->g, 0, 0)) {
+            int i = a->placeholder;
+            doc_free(p);
+            memmove(&a->docs[i], &a->docs[i + 1], (size_t)(a->ndocs - i - 1) * sizeof(Doc));
+            a->ndocs--;
+            if (a->cur >= a->ndocs) a->cur = a->ndocs ? a->ndocs - 1 : 0;
+        }
+    }
+    a->placeholder = -1;
+    int i = doc_add(a, base(path), strdup(path), fmt, g);
+    if (i < 0) return;
+    a->docs[i].delim = delim;
+    static const char *const hows[] = {"", "", " detected", " chosen"};
+    if (fmt == FMT_CSV)
+        snprintf(a->msg, sizeof a->msg, "opened %.150s (%s, %s%s)", path, io_fmt_name(fmt),
+                 delim_name(delim), hows[how]);
+    else snprintf(a->msg, sizeof a->msg, "opened %.150s (%s)", path, io_fmt_name(fmt));
+}
+
+/* ---------- delimiter prompt for delimited files (File > Import > Ask) ---------- */
+
+/* the item in open_delim_menu for a delimiter */
+static int pend_item(int delim) {
+    int k = 0;
+    for (const MenuItem *it = open_delim_menu; it->label; it++) {
+        if (!strcmp(it->label, "-")) continue;
+        if (act_delim(it->act) == delim) return k;
+        k++;
+    }
+    return 0;
+}
+
+static Block blk_from_delim(const char *t, int delim);
+static void blk_free(Block *b);
+static void dlg_refresh(App *a);
+
+/* Shows the prompt for the first queued file. Each choice's description is
+   how the file's first line splits with it. */
+static void pend_show(App *a) {
+    PendOpen *p = &a->pend[0];
+    snprintf(a->pend_title, sizeof a->pend_title, "Delimiter for %.60s (detected: %s)",
+             base(p->path), delim_name(p->det));
+    size_t s = 0;
+    while (s < p->len && (p->buf[s] == '\n' || p->buf[s] == '\r')) s++;
+    size_t e = s;
+    while (e < p->len && e - s < 4000 && p->buf[e] != '\n' && p->buf[e] != '\r') e++;
+    char *line = strndup(p->buf + s, e - s);
+    int k = 0;
+    for (const MenuItem *it = open_delim_menu; it->label && k < 5; it++) {
+        if (!strcmp(it->label, "-")) continue;
+        char *o = a->pend_desc[k++];
+        size_t on = sizeof a->pend_desc[0];
+        Block b = line ? blk_from_delim(line, act_delim(it->act)) : (Block){0, 0, NULL, NULL, 0, NULL};
+        int l = snprintf(o, on, "first line splits into %d field%s:", b.cols, b.cols == 1 ? "" : "s");
+        for (int c = 0; c < b.cols && l > 0 && (size_t)l < on - 8; c++) {
+            const char *v = b.v[c] ? b.v[c] : "";
+            l += snprintf(o + l, on - (size_t)l, "%s%s", c ? " | " : " ", v);
+        }
+        if ((size_t)l >= on - 1) memcpy(o + on - 4, "...", 4);
+        blk_free(&b);
+    }
+    free(line);
+    a->acts = open_delim_menu;
+    a->acts_title = a->pend_title;
+    a->mode = MODE_DLG;
+    a->dlg_kind = DLGK_MAIN;
+    a->dlg_top = 0;
+    a->dlg_sel = pend_item(p->det);
+    a->npanels = 0;
+    a->mb = -1;
+    dlg_refresh(a);
+    snprintf(a->msg, sizeof a->msg, "%.60s: Enter opens with the highlighted delimiter, Esc cancels",
+             base(p->path));
+}
+
+/* Drops the first queued file: opened with delim, or (delim < 0) cancelled. */
+static void pend_next(App *a, int delim) {
+    PendOpen p = a->pend[0];
+    a->npend--;
+    memmove(&a->pend[0], &a->pend[1], (size_t)a->npend * sizeof a->pend[0]);
+    if (delim >= 0) {
+        Txn *paused = txn_pause();
+        open_buf(a, p.path, p.buf, p.len, FMT_CSV, delim, delim == p.det ? 2 : 3);
+        txn_resume(paused);
+    } else {
+        snprintf(a->msg, sizeof a->msg, "not opened: %.200s", p.path);
+        free(p.buf);
+    }
+    free(p.path);
+    if (a->npend) {
+        char keep[256];
+        snprintf(keep, sizeof keep, "%s", a->msg);
+        pend_show(a);
+        snprintf(a->msg, sizeof a->msg, "%s", keep);
+    } else {
+        a->acts = NULL;
+        a->mode = MODE_NORMAL;
+        a->placeholder = -1;
+    }
 }
 
 static void load_path_do(App *a, const char *path) {
@@ -133,23 +253,29 @@ static void load_path_do(App *a, const char *path) {
         snprintf(a->msg, sizeof a->msg, "cannot open %s", path);
         return;
     }
-    int fmt = io_fmt_from_path(path);
+    int fmt = io_fmt_from_path(path), delim = 0, how = 0;
     if (fmt < 0) fmt = a->imp_delim ? FMT_CSV : io_fmt_from_text(buf, len);
-    Sheet *g = sheet_new();
-    char err[256];
-    if (!g || io_parse_delim(g, buf, len, fmt, fmt == FMT_CSV ? a->imp_delim : 0, err, sizeof err) < 0) {
-        snprintf(a->msg, sizeof a->msg, "%.100s: %.140s", path, err);
-        sheet_free(g);
-        free(buf);
-        return;
+    if (fmt == FMT_TSV && io_fmt_from_path(path) < 0) fmt = FMT_CSV;   /* sniffed: detect below */
+    if (fmt == FMT_CSV) {
+        how = a->imp_delim ? 1 : 2;
+        delim = a->imp_delim ? a->imp_delim : io_detect_delim(buf, len, NULL);
+        if (how == 2 && a->imp_ask && a->npend < (int)(sizeof a->pend / sizeof a->pend[0])
+            && !memchr(buf, '\0', len)) {
+            /* ask first; the detected delimiter is highlighted */
+            PendOpen *p = &a->pend[a->npend++];
+            p->path = strdup(path);
+            p->buf = buf;
+            p->len = len;
+            p->det = delim;
+            if (a->npend == 1) pend_show(a);
+            return;
+        }
     }
-    free(buf);
-    if (doc_add(a, base(path), strdup(path), fmt, g) >= 0)
-        snprintf(a->msg, sizeof a->msg, "opened %s (%s)", path, io_fmt_name(fmt));
+    open_buf(a, path, buf, len, fmt, delim, how);
 }
 
 static const char *delim_name(int c) {
-    return c == ';' ? "semicolon" : c == '\t' ? "tab" : c == '|' ? "pipe"
+    return c == 0 ? "auto-detect" : c == ';' ? "semicolon" : c == '\t' ? "tab" : c == '|' ? "pipe"
          : c == ' ' ? "space" : "comma";
 }
 
@@ -171,7 +297,11 @@ static void fmt_num_set(App *a, int field, const char *s, int dec, int style) {
                 if (body[0] == '%') continue;
                 NumSpec ns;
                 num_parse(body, &ns);
-                if (field == 0) ns.style = style;
+                if (field == 0) {
+                    /* Fortran digits are mantissa digits, not decimal places: start afresh */
+                    if ((ns.style == 'D') != (style == 'D')) ns.dec = -1;
+                    ns.style = style;
+                }
                 else if (field == 1) snprintf(ns.pre, sizeof ns.pre, "%s", s);
                 else if (field == 2) snprintf(ns.suf, sizeof ns.suf, "%s", s);
                 else ns.dec = dec;
@@ -212,8 +342,9 @@ static int act_on(const App *a, int act) {
     switch (act) {
     case A_XOPT_COMMA: case A_XOPT_SEMI: case A_XOPT_TAB: case A_XOPT_PIPE: case A_XOPT_SPACE:
         return (a->xo.delim ? a->xo.delim : ',') == act_delim(act);     /* 0 means comma */
-    case A_IMP_COMMA: case A_IMP_SEMI: case A_IMP_TAB: case A_IMP_PIPE: case A_IMP_SPACE:
-        return (a->imp_delim ? a->imp_delim : ',') == act_delim(act);
+    case A_IMP_AUTO: case A_IMP_COMMA: case A_IMP_SEMI: case A_IMP_TAB: case A_IMP_PIPE: case A_IMP_SPACE:
+        return a->imp_delim == act_delim(act);                          /* 0 means auto-detect */
+    case A_IMP_ASK:      return a->imp_ask;
     case A_XOPT_CRLF:    return a->xo.crlf;
     case A_XOPT_SELONLY: return a->xo.sel_only;
     case A_FMT_BOLD:     return sel_all_fmt(a, 0, 0);
@@ -228,6 +359,7 @@ static int act_on(const App *a, int act) {
     case A_INT_SPACE:    return sel_all_fmt(a, 5, ' ');
     case A_INT_SCI:      return sel_all_fmt(a, 5, 'e');
     case A_INT_ENG:      return sel_all_fmt(a, 5, 'g');
+    case A_INT_FORT:     return sel_all_fmt(a, 5, 'D');
     default:             return 0;
     }
 }
@@ -240,7 +372,8 @@ static int act_is_setting(int act) {
     switch (act) {
     case A_XOPT_COMMA: case A_XOPT_SEMI: case A_XOPT_TAB: case A_XOPT_PIPE: case A_XOPT_SPACE:
     case A_XOPT_CRLF: case A_XOPT_SELONLY:
-    case A_IMP_COMMA: case A_IMP_SEMI: case A_IMP_TAB: case A_IMP_PIPE: case A_IMP_SPACE:
+    case A_IMP_AUTO: case A_IMP_COMMA: case A_IMP_SEMI: case A_IMP_TAB: case A_IMP_PIPE: case A_IMP_SPACE:
+    case A_IMP_ASK:
         return 1;
     default:
         return 0;
@@ -254,6 +387,7 @@ static int act_delim(int act) {
     case A_XOPT_TAB:  case A_IMP_TAB:    return '\t';
     case A_XOPT_PIPE: case A_IMP_PIPE:   return '|';
     case A_XOPT_SPACE: case A_IMP_SPACE: return ' ';
+    case A_IMP_AUTO:                     return 0;
     default:                             return ',';
     }
 }
@@ -290,7 +424,10 @@ static void save_path(App *a, Doc *d, const char *path, int fmt) {
         if (!tmp) { snprintf(a->msg, sizeof a->msg, "out of memory"); return; }
         src = tmp;
     }
-    int rc = io_save(src, sheetname, path, fmt, &a->xo, err, sizeof err);
+    /* CSV keeps the delimiter the file was read with, unless one was chosen in Export */
+    ExpOpt xo = a->xo;
+    if (fmt == FMT_CSV && !xo.delim && d->delim) xo.delim = d->delim;
+    int rc = io_save(src, sheetname, path, fmt, &xo, err, sizeof err);
     sheet_free(tmp);
     if (rc < 0) {
         snprintf(a->msg, sizeof a->msg, "%.250s", err);
@@ -733,6 +870,15 @@ static void end_edit(App *a, int commit) {
                           kind == 3 ? "%H:%M:%S" : kind == 2 ? "%Y-%m-%d %H:%M" : "%Y-%m-%d", -1, -1);
         } else {
             sheet_set(d->g, d->cr, d->cc, a->ebuf);
+            char fb[64];
+            if (num_fortran_fmt(a->ebuf, fb, sizeof fb)) {  /* typed 1.d2: Fortran format, styles kept */
+                int al, bo, hl;
+                const char *body;
+                char f[320];
+                fmt_parse(sheet_fmt(d->g, d->cr, d->cc), &al, &bo, &hl, &body);
+                fmt_build(f, sizeof f, al, bo, hl, fb);
+                sheet_fmt_set(d->g, d->cr, d->cc, f);
+            }
         }
         d->dirty = 1;
     }
@@ -890,6 +1036,42 @@ static Block blk_from_tsv(const char *t) {
             start = i + 1;
         }
     }
+    return b;
+}
+
+/* Delimited text (quotes as in CSV) as a block, using the file reader on a
+   scratch sheet. Blanks around a field are dropped, as for tab-separated text.
+   Returns a 0x0 block when the text does not parse (an unclosed quote). */
+static Block blk_from_delim(const char *t, int delim) {
+    Block b = {0, 0, NULL, NULL, 0, NULL};
+    Sheet *s = sheet_new();
+    if (!s) return b;
+    char err[128];
+    Txn *j = txn_pause();                 /* the scratch sheet is not part of undo */
+    int rc = io_parse_delim(s, t, strlen(t), FMT_CSV, delim, err, sizeof err);
+    txn_resume(j);
+    if (rc == 0) {
+        int rows = 0, cols = 0;
+        for (int r = 0; r <= s->max_r; r++)
+            for (int c = 0; c <= s->max_c; c++)
+                if (sheet_get_raw(s, r, c)) {
+                    if (r + 1 > rows) rows = r + 1;
+                    if (c + 1 > cols) cols = c + 1;
+                }
+        if (rows && cols) {
+            b = blk_new(rows, cols);
+            for (int r = 0; r < rows; r++)
+                for (int c = 0; c < cols; c++) {
+                    const char *v = sheet_get_raw(s, r, c);
+                    if (!v) continue;
+                    while (isspace((unsigned char)*v)) v++;
+                    size_t n = strlen(v);
+                    while (n && isspace((unsigned char)v[n - 1])) n--;
+                    if (n) b.v[r * cols + c] = strndup(v, n);
+                }
+        }
+    }
+    sheet_free(s);
     return b;
 }
 
@@ -1117,6 +1299,10 @@ static void paste_fmt(Doc *d, int rr, int cc, const Block *src, int idx, const c
     }
     char body[200] = "", raw[160];
     NumSpec ns;
+    if (t && t[0] != '=' && num_fortran_fmt(t, body, sizeof body)) {
+        sheet_fmt_set(d->g, rr, cc, body);              /* 1.d2: kept as typed, Fortran format */
+        return;
+    }
     if (t && t[0] != '=' && num_from_text(t, raw, sizeof raw, &ns)) {
         sheet_set(d->g, rr, cc, raw);
         if (ns.style != '-' || ns.dec >= 0 || ns.pre[0] || ns.suf[0]) num_build(body, sizeof body, &ns);
@@ -1142,11 +1328,19 @@ static void paste_block_at_cursor(App *a, const Block *src) {
     snprintf(a->msg, sizeof a->msg, "pasted %dx%d", src->rows, src->cols);
 }
 
-/* act: A_PASTE, A_PASTE_VALUES, A_PASTE_FORMULAS, A_PASTE_FMT, A_PASTE_TRANSPOSE */
+/* act: A_PASTE, A_PASTE_VALUES, A_PASTE_FORMULAS, A_PASTE_FMT, A_PASTE_TRANSPOSE,
+   A_PASTE_ROWS, A_PASTE_COLS (clipboard text split on its detected delimiter;
+   each line becomes a row, or a column) */
 static void do_paste(App *a, int act) {
     if (single_only(a)) return;
     Doc *d = D(a);
     char *txt = clip_get();
+    int delimited = act == A_PASTE_ROWS || act == A_PASTE_COLS;
+    if (delimited && (!txt || !*txt)) {
+        free(txt);
+        snprintf(a->msg, sizeof a->msg, "clipboard has no text");
+        return;
+    }
     if (!txt || !*txt) {
         /* no plain text: an HTML-only clipboard (some apps offer just a table) */
         free(txt);
@@ -1164,11 +1358,26 @@ static void do_paste(App *a, int act) {
         snprintf(a->msg, sizeof a->msg, "clipboard is empty");
         return;
     }
-    int internal = a->clip.valid && a->clip.text && !strcmp(txt, a->clip.text);
+    int internal = !delimited && a->clip.valid && a->clip.text && !strcmp(txt, a->clip.text);
     Block own = {0, 0, NULL, NULL, 0, NULL};
-    int owned = 0, shift = 0, dr = 0, dc = 0;
+    int owned = 0, shift = 0, dr = 0, dc = 0, used_delim = 0;
     const Block *src;
-    if (internal) {
+    if (delimited) {
+        used_delim = io_detect_delim(txt, strlen(txt), NULL);
+        own = blk_from_delim(txt, used_delim);
+        if (!own.rows) {
+            free(txt);
+            snprintf(a->msg, sizeof a->msg, "clipboard text is not delimited data (unclosed quote?)");
+            return;
+        }
+        if (act == A_PASTE_COLS) {
+            Block t = blk_transpose(&own);
+            blk_free(&own);
+            own = t;
+        }
+        owned = 1;
+        src = &own;
+    } else if (internal) {
         int values = act == A_PASTE_VALUES || a->clip.values;
         src = values ? &a->clip.disp : &a->clip.raw;
         if (!values) { shift = 1; dr = d->cr - a->clip.r0; dc = d->cc - a->clip.c0; }
@@ -1189,6 +1398,15 @@ static void do_paste(App *a, int act) {
                 }
                 html_table_free(&t);
                 free(html);
+            }
+        }
+        if (!owned && !strchr(txt, '\t')) {
+            /* no tabs: several lines that all split the same way on another
+               delimiter (CSV from an editor, a terminal) are a table too */
+            int sure = 0, dl = io_detect_delim(txt, strlen(txt), &sure);
+            if (sure && dl != ' ') {
+                own = blk_from_delim(txt, dl);
+                if (own.rows) { owned = 1; used_delim = dl; }
             }
         }
         if (!owned) { own = blk_from_tsv(txt); owned = 1; }
@@ -1216,7 +1434,10 @@ static void do_paste(App *a, int act) {
     d->ac = d->cc;
     move_to(a, d->cr + rows - 1, d->cc + cols - 1, 1);
     d->dirty = 1;
-    snprintf(a->msg, sizeof a->msg, "pasted %dx%d", rows, cols);
+    if (used_delim)
+        snprintf(a->msg, sizeof a->msg, "pasted %dx%d (%s-delimited%s)", rows, cols, delim_name(used_delim),
+                 act == A_PASTE_COLS ? ", lines as columns" : act == A_PASTE_ROWS ? ", lines as rows" : "");
+    else snprintf(a->msg, sizeof a->msg, "pasted %dx%d", rows, cols);
     if (owned) blk_free(&own);
     free(txt);
 }
@@ -1767,7 +1988,7 @@ void run_action(App *a, int act) {
     case A_COPY_FMT:    do_copy(a, 0, 2); break;
     case A_COPY_LATEX:  do_copy(a, 0, 3); break;
     case A_PASTE: case A_PASTE_VALUES: case A_PASTE_FORMULAS:
-    case A_PASTE_FMT: case A_PASTE_TRANSPOSE:
+    case A_PASTE_FMT: case A_PASTE_TRANSPOSE: case A_PASTE_ROWS: case A_PASTE_COLS:
         do_paste(a, act);
         break;
     case A_CLEAR:   do_clear(a); break;
@@ -1855,11 +2076,11 @@ void run_action(App *a, int act) {
         break;
     }
     case A_GRAPH_EXTRA:
-        start_prompt(a, "Extra gnuplot commands (separate with ;): ", a->gextra, A_GRAPH_EXTRA, -1);
+        graph_raw_prompt(a, "Extra gnuplot commands (separate with ;): ");
         break;
     case A_XOPT_COMMA: case A_XOPT_SEMI: case A_XOPT_TAB: case A_XOPT_PIPE: case A_XOPT_SPACE:
         a->xo.delim = act_delim(act);
-        snprintf(a->msg, sizeof a->msg, "export delimiter: %s", delim_name(a->xo.delim));
+        snprintf(a->msg, sizeof a->msg, "export delimiter: %s", delim_name(a->xo.delim ? a->xo.delim : ','));
         break;
     case A_XOPT_CRLF:
         a->xo.crlf = !a->xo.crlf;
@@ -1881,13 +2102,14 @@ void run_action(App *a, int act) {
                      pre ? ns.pre : ns.suf, act, -1);
         break;
     }
-    case A_INT_PLAIN: case A_INT_COMMA: case A_INT_SPACE: case A_INT_SCI: case A_INT_ENG: {
+    case A_INT_PLAIN: case A_INT_COMMA: case A_INT_SPACE: case A_INT_SCI: case A_INT_ENG:
+    case A_INT_FORT: {
         int st = act == A_INT_PLAIN ? '-' : act == A_INT_COMMA ? ',' : act == A_INT_SPACE ? ' '
-               : act == A_INT_SCI ? 'e' : 'g';
+               : act == A_INT_SCI ? 'e' : act == A_INT_FORT ? 'D' : 'g';
         int_toggle(a, st);
         snprintf(a->msg, sizeof a->msg, "numbers: %s",
                  st == '-' ? "plain" : st == ',' ? "1,000" : st == ' ' ? "1 000"
-                 : st == 'e' ? "1*10^3" : "1 k");
+                 : st == 'e' ? "1*10^3" : st == 'D' ? "Fortran 1.0D+03" : "1 k");
         break;
     }
     case A_CONV_TO:
@@ -1897,10 +2119,14 @@ void run_action(App *a, int act) {
     case A_DLG_EXPORT: dialog_acts(a, export_menu, "Export"); break;
     case A_XOPT_SHOW:
         snprintf(a->msg, sizeof a->msg, "export: %s delimiter, %s, selection only %s; open: %s delimiter",
-                 delim_name(a->xo.delim), a->xo.crlf ? "CRLF" : "LF",
+                 a->xo.delim ? delim_name(a->xo.delim) : "file's own (comma)", a->xo.crlf ? "CRLF" : "LF",
                  a->xo.sel_only ? "on" : "off", delim_name(a->imp_delim));
         break;
-    case A_IMP_COMMA: case A_IMP_SEMI: case A_IMP_TAB: case A_IMP_PIPE: case A_IMP_SPACE:
+    case A_IMP_ASK:
+        a->imp_ask = !a->imp_ask;
+        snprintf(a->msg, sizeof a->msg, "ask for the delimiter when opening: %s", a->imp_ask ? "on" : "off");
+        break;
+    case A_IMP_AUTO: case A_IMP_COMMA: case A_IMP_SEMI: case A_IMP_TAB: case A_IMP_PIPE: case A_IMP_SPACE:
         a->imp_delim = act_delim(act);
         snprintf(a->msg, sizeof a->msg, "opening text files: %s delimiter", delim_name(a->imp_delim));
         break;
@@ -1961,18 +2187,21 @@ static void resize_key(App *a, const Event *e) {
 
 /* ---------- graph ---------- */
 
+/* Graphs every selected area together (Ctrl+click areas included). One cell
+   selected graphs the whole data. The commands are reread from the plot file
+   first, so edits made there take effect at once. */
 static void graph_run(App *a, int view) {
-    if (single_only(a)) return;
     Doc *d = D(a);
-    int r1, c1, r2, c2;
-    used_sel(d, &r1, &c1, &r2, &c2);
-    if (r1 == r2 && c1 == c2) {                 /* one cell selected: graph the whole data */
-        r1 = c1 = 0;
-        r2 = d->g->max_r;
-        c2 = d->g->max_c;
+    Rect q[MAX_RECTS];
+    int nq = doc_rects(d, q);
+    if (nq == 1 && q[0].r1 == q[0].r2 && q[0].c1 == q[0].c2) {
+        q[0].r1 = q[0].c1 = 0;
+        q[0].r2 = d->g->max_r;
+        q[0].c2 = d->g->max_c;
     }
+    plot_file_read(a->gextra, sizeof a->gextra);
     char pdf[PATH_MAX], msg[256];
-    if (graph_draw(d, r1, c1, r2, c2, a->gextra, d->name, pdf, sizeof pdf, msg, sizeof msg, view) == 0) {
+    if (graph_draw(d, q, nq, a->gextra, d->name, pdf, sizeof pdf, msg, sizeof msg, view) == 0) {
         if (!view) graph_open(pdf);
         if (!view) snprintf(a->msg, sizeof a->msg, "graph opened: %.200s", pdf);
         else snprintf(a->msg, sizeof a->msg, "%s", msg);
@@ -2053,12 +2282,12 @@ static void vim_normal(App *a, const Event *e) {
    Every option is a gnuplot command in a->gextra (';' separated). The editor,
    the right-click menu and the preview all read and write that text. */
 
-typedef struct { char t[64][320]; int n; } Toks;
+typedef struct { char t[128][320]; int n; } Toks;
 
 static void toks_split(Toks *k, const char *s) {
     k->n = 0;
     const char *p = s;
-    while (*p && k->n < 64) {
+    while (*p && k->n < 128) {
         const char *e = strchr(p, ';');
         size_t len = e ? (size_t)(e - p) : strlen(p);
         const char *q = p;
@@ -2085,7 +2314,7 @@ static void toks_join(const Toks *k, char *out, size_t n) {
 }
 
 static void tok_add(Toks *k, const char *t) {
-    if (k->n < 64) {
+    if (k->n < 128) {
         snprintf(k->t[k->n], sizeof k->t[0], "%s", t);
         k->n++;
     }
@@ -2162,8 +2391,17 @@ static void dlg_add(App *a, const char *label, int act, int inv, const char *des
 /* The items of a menu, as dialog rows: separators are skipped, a row shows [*] when on. */
 static void acts_refresh(App *a) {
     a->ndlg = 0;
+    int k = 0;
     for (const MenuItem *it = a->acts; it->label; it++) {
         if (!strcmp(it->label, "-")) continue;
+        if (a->npend && a->acts == open_delim_menu) {      /* the open prompt: [*] = detected */
+            char label[200];
+            int on = act_delim(it->act) == a->pend[0].det;
+            snprintf(label, sizeof label, "[%c] %s", on ? '*' : ' ', it->label);
+            dlg_add(a, label, it->act, on, k < 5 ? a->pend_desc[k] : it->desc);
+            k++;
+            continue;
+        }
         int on = act_on(a, it->act);
         char label[200];
         if (it->key[0]) snprintf(label, sizeof label, "[%c] %s   %s", on ? '*' : ' ', it->label, it->key);
@@ -2173,6 +2411,7 @@ static void acts_refresh(App *a) {
 }
 
 enum { GI_DRAW = -1, GI_RAW = -2, GI_CLOSE = -3 };
+enum { GC_CUSTOM = 100, GC_DEFAULT = 101 };   /* extra rows in an argument's choice list */
 
 static void dlg_follow(App *a) {
     int L = ui_dlg_list_rows(a);
@@ -2209,12 +2448,22 @@ static void dlg_refresh(App *a) {
     }
     /* choices of one option: the current value is inverted */
     const GraphOpt *o = &graph_opts[a->dlg_opt];
-    int on = opt_find(&k, o, val, sizeof val);
-    for (int i = 0; o->choices[i]; i++)
-        dlg_add(a, o->choices[i], i, on && !strcmp(val, o->choices[i]), o->help);
+    int on = opt_find(&k, o, val, sizeof val), known = 0;
+    for (int i = 0; o->choices[i]; i++) {
+        int cur = on && !strcmp(val, o->choices[i]);
+        known |= cur;
+        dlg_add(a, o->choices[i], i, cur, o->help);
+    }
+    if (o->kind == GO_ARG) {                   /* an argument: also any text, or none */
+        char lab[200];
+        snprintf(lab, sizeof lab, "Custom...%s%.60s", on && !known ? "  " : "", on && !known ? val : "");
+        dlg_add(a, lab, GC_CUSTOM, on && !known, o->help);
+        dlg_add(a, "Default (not set)", GC_DEFAULT, !on, o->help);
+    }
 }
 
 static void dialog_open(App *a) {
+    plot_file_read(a->gextra, sizeof a->gextra);     /* show edits made in the file */
     a->acts = NULL;
     a->mode = MODE_DLG;
     a->dlg_kind = DLGK_MAIN;
@@ -2236,9 +2485,31 @@ static void dialog_acts(App *a, const MenuItem *items, const char *title) {
     dlg_refresh(a);
 }
 
+/* Keeps the plot file in step with the options editor. */
+static void plot_save(App *a) {
+    if (plot_file_write(a->gextra) < 0) {
+        char path[PATH_MAX];
+        plot_file_path(path, sizeof path);
+        snprintf(a->msg, sizeof a->msg, "cannot write %.200s", path);
+        a->warn = 1;
+    }
+}
+
 static void graph_text_store(App *a, Toks *k) {
     toks_join(k, a->gextra, sizeof a->gextra);
+    plot_save(a);
     dlg_refresh(a);
+}
+
+/* The raw-text prompt holds EBUF_MAX bytes; longer command text is edited in the file. */
+static void graph_raw_prompt(App *a, const char *label) {
+    if (strlen(a->gextra) >= EBUF_MAX - 1) {
+        char path[PATH_MAX];
+        plot_file_path(path, sizeof path);
+        snprintf(a->msg, sizeof a->msg, "command text is long: edit %.200s", path);
+        return;
+    }
+    start_prompt(a, label, a->gextra, A_GRAPH_EXTRA, -1);
 }
 
 /* text prompts (an argument's value, or the raw command text) */
@@ -2255,6 +2526,7 @@ static void dlg_activate(App *a) {
     dlg_refresh(a);
     if (a->dlg_sel < 0 || a->dlg_sel >= a->ndlg) return;
     int act = a->dlg[a->dlg_sel].act;
+    if (a->acts && a->npend && a->acts == open_delim_menu) { pend_next(a, act_delim(act)); return; }
     if (a->acts) {
         if (!act_is_setting(act)) { a->acts = NULL; a->mode = MODE_NORMAL; }
         run_action(a, act);              /* a setting stays open: the list shows its new state */
@@ -2267,7 +2539,7 @@ static void dlg_activate(App *a) {
         if (act == GI_DRAW) { a->mode = MODE_NORMAL; graph_run(a, 0); return; }
         if (act == GI_CLOSE) { a->mode = MODE_NORMAL; return; }
         if (act == GI_RAW) {
-            start_prompt(a, "Command text (;-separated): ", a->gextra, A_GRAPH_EXTRA, -1);
+            graph_raw_prompt(a, "Command text (;-separated): ");
             return;
         }
         const GraphOpt *o = &graph_opts[act];
@@ -2275,7 +2547,7 @@ static void dlg_activate(App *a) {
             int on = opt_find(&k, o, val, sizeof val);
             opt_put(&k, o, on ? NULL : "on");
             graph_text_store(a, &k);
-        } else if (o->kind == GO_CHOICE) {
+        } else if (o->kind == GO_CHOICE || o->choices) {
             a->dlg_kind = DLGK_CHOICE;
             a->dlg_opt = act;
             a->dlg_sel = a->dlg_top = 0;
@@ -2290,8 +2562,20 @@ static void dlg_activate(App *a) {
     }
     /* a choice was picked: apply it and return to the list */
     const GraphOpt *o = &graph_opts[a->dlg_opt];
-    opt_put(&k, o, o->choices[act]);
-    snprintf(a->msg, sizeof a->msg, "%s: %s", o->name, o->choices[act]);
+    if (act == GC_CUSTOM) {
+        opt_find(&k, o, val, sizeof val);
+        a->dlg_kind = DLGK_MAIN;
+        a->dlg_sel = a->dlg_opt;
+        start_prompt(a, o->name, val, A_DLG_ARG, -1);
+        return;
+    }
+    if (act == GC_DEFAULT) {
+        opt_put(&k, o, NULL);
+        snprintf(a->msg, sizeof a->msg, "%s cleared", o->name);
+    } else {
+        opt_put(&k, o, o->choices[act]);
+        snprintf(a->msg, sizeof a->msg, "%s: %s", o->name, o->choices[act]);
+    }
     a->dlg_kind = DLGK_MAIN;
     a->dlg_sel = a->dlg_opt;
     a->dlg_top = 0;
@@ -2301,7 +2585,12 @@ static void dlg_activate(App *a) {
 
 static void dlg_key(App *a, const Event *e) {
     dlg_refresh(a);
-    if (a->acts && e->key == 27) { a->acts = NULL; a->mode = MODE_NORMAL; return; }
+    if (a->acts && e->key == 27) {
+        if (a->npend && a->acts == open_delim_menu) { pend_next(a, -1); return; }
+        a->acts = NULL;
+        a->mode = MODE_NORMAL;
+        return;
+    }
     switch (e->key) {
     case K_UP:   a->dlg_sel = (a->dlg_sel + a->ndlg - 1) % a->ndlg; dlg_follow(a); break;
     case K_DOWN: a->dlg_sel = (a->dlg_sel + 1) % a->ndlg; dlg_follow(a); break;
@@ -2342,6 +2631,7 @@ static void dlg_mouse(App *a, const Event *e) {
         return;
     }
     if (e->mtype == MS_PRESS) {                  /* outside: back out, or close */
+        if (a->npend && a->acts == open_delim_menu) return;   /* the open prompt needs an answer */
         if (a->acts) { a->acts = NULL; a->mode = MODE_NORMAL; return; }
         if (a->dlg_kind != DLGK_MAIN) {
             a->dlg_kind = DLGK_MAIN;
@@ -2353,14 +2643,20 @@ static void dlg_mouse(App *a, const Event *e) {
 
 /* menu actions: toggle a flag, set a choice, or toggle the legend */
 static void graph_menu_action(App *a, int act) {
+    plot_file_read(a->gextra, sizeof a->gextra);
     Toks k;
     toks_split(&k, a->gextra);
     char val[320];
     if (act >= A_GOPT_VAL) {
         int v = act - A_GOPT_VAL, idx = v / 32, ch = v % 32;
         const GraphOpt *o = &graph_opts[idx];
-        opt_put(&k, o, o->choices[ch]);
-        snprintf(a->msg, sizeof a->msg, "%s: %s", o->name, o->choices[ch]);
+        if (o->kind == GO_ARG && opt_find(&k, o, val, sizeof val) && !strcmp(val, o->choices[ch])) {
+            opt_put(&k, o, NULL);                         /* set already: the item turns it off */
+            snprintf(a->msg, sizeof a->msg, "%s cleared", o->name);
+        } else {
+            opt_put(&k, o, o->choices[ch]);
+            snprintf(a->msg, sizeof a->msg, "%s: %s", o->name, o->choices[ch]);
+        }
     } else {
         int idx = act - A_GOPT_BASE;
         const GraphOpt *o = &graph_opts[idx];
@@ -2402,8 +2698,9 @@ static void prompt_accept(App *a) {
         return;
     }
     if (a->prompt_act == A_GRAPH_EXTRA) {          /* may be cleared to empty */
-        snprintf(a->gextra, sizeof a->gextra, "%.1000s", a->ebuf);
+        snprintf(a->gextra, sizeof a->gextra, "%s", a->ebuf);
         snprintf(a->msg, sizeof a->msg, "graph commands updated");
+        plot_save(a);
         return;
     }
     if (a->prompt_act == A_PREFIX || a->prompt_act == A_SUFFIX) {       /* empty clears it */
@@ -2936,9 +3233,13 @@ int main(int argc, char **argv) {
     char *files[64];
     int nf = 0, stdin_fmt = -1, use_stdin = !isatty(0);
     a->vim = vim_default;
+    a->imp_ask = 1;
+    a->placeholder = -1;
     a->mhov = -1;
     a->hov_r = a->hov_c = -1;
     snprintf(a->gextra, sizeof a->gextra, "%s", GRAPH_DEFAULTS);
+    if (plot_file_read(a->gextra, sizeof a->gextra) < 0)        /* first run: create it */
+        plot_file_write(a->gextra);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(); return 0; }
         if (!strcmp(argv[i], "--version")) { printf("%s %s\n", TSHEET_NAME, TSHEET_VERSION); return 0; }
@@ -2956,20 +3257,26 @@ int main(int argc, char **argv) {
         char *buf;
         size_t len;
         if (io_read_fd(0, &buf, &len) < 0) { fprintf(stderr, "tsheet: cannot read stdin\n"); return 1; }
-        int fmt = stdin_fmt >= 0 ? stdin_fmt : io_fmt_from_text(buf, len);
+        int fmt = stdin_fmt >= 0 ? stdin_fmt : io_fmt_from_text(buf, len), delim = 0;
+        if (stdin_fmt < 0 && fmt == FMT_TSV) fmt = FMT_CSV;             /* sniffed: detect below */
+        if (fmt == FMT_CSV) delim = a->imp_delim ? a->imp_delim : io_detect_delim(buf, len, NULL);
         Sheet *g = sheet_new();
         char err[256];
-        if (!g || io_parse_delim(g, buf, len, fmt, fmt == FMT_CSV ? a->imp_delim : 0, err, sizeof err) < 0) {
+        if (!g || io_parse_delim(g, buf, len, fmt, delim, err, sizeof err) < 0) {
             fprintf(stderr, "tsheet: stdin is not a valid %s sheet: %s\n", io_fmt_name(fmt), err);
             free(buf);
             sheet_free(g);
             return 1;
         }
         free(buf);
-        doc_add(a, "stdin", NULL, fmt, g);
+        int di = doc_add(a, "stdin", NULL, fmt, g);
+        if (di >= 0) a->docs[di].delim = delim;
     }
     for (int i = 0; i < nf; i++) load_path(a, files[i]);
-    if (a->ndocs == 0) doc_new(a);
+    if (a->ndocs == 0) {
+        doc_new(a);
+        if (a->npend) a->placeholder = 0;       /* replaced by the first file the prompt opens */
+    }
 
     if (term_init() < 0) {
         fprintf(stderr, "tsheet: no terminal available\n");
@@ -2989,6 +3296,8 @@ int main(int argc, char **argv) {
         handle(a, &e);
         while (!a->quit && (r = term_poll(&e, 0)) > 0) handle(a, &e);   /* coalesce bursts */
         if (a->quit) break;
+        /* a file waiting for its delimiter keeps the prompt up over other dialogs */
+        if (a->npend && !(a->mode == MODE_DLG && a->acts == open_delim_menu)) pend_show(a);
         if (a->mode == MODE_DLG) dlg_refresh(a);
         ui_draw(a);
         term_flush();

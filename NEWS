@@ -1,6 +1,42 @@
 tsheet alpha1
 ============
 
+Fortran numbers
+- 1.5D+03, 1.d2, 2.0Q-5 and 1.234567-100 (E-less, three-digit exponent) are
+  numbers: in cells, formulas (=1.5D3*2), files, paste, sorting, statistics,
+  graphs and XLSX/ODS export. Blanks around a number no longer make it text.
+- Format > Numbers > Fortran: 1.0D+03. Decimal places sets the mantissa digits.
+- Opening a delimited file, pasting or typing sets that format on every cell
+  written in Fortran form, keeping its mantissa digits (1.d2 -> 1.D+02).
+- Plain (or no number format) shows Fortran text as an ordinary number:
+  1.5D+03 as 1500, 6.02D+23 as 6.02e+23. Switching into or out of Fortran
+  starts the digits afresh, so Fortran digits never become decimal places.
+- Graph: x format and y format offer a list, Fortran style first
+  (%.1tD%+03T), plus Custom... and Default. Right-click > Graph > Fortran
+  labels X / Y toggle them.
+- A number too wide for its column is shown with fewer digits, its exponent
+  kept, or as #### when it cannot fit. Digits are never cut off.
+
+Delimiters
+- Delimited files have their delimiter detected (tab, semicolon, pipe, comma,
+  spaces); "1,5;2,7" is read as semicolon data with decimal commas.
+- Opening one asks for the delimiter, the detected one highlighted, with a
+  preview of the first line. File > Import > "Ask for delimiter on open"
+  toggles the question; "Delimiter: auto-detect" is the new default.
+- Ctrl+S writes a CSV back with the delimiter it was read with.
+
+Paste
+- Edit > Paste > Delimited into rows / into columns: clipboard text split on its
+  detected delimiter, each line laid out as a row or as a column.
+- Ctrl+V splits multi-line text that is plainly a table (every line splits the
+  same way); a single sentence with a comma stays one cell.
+
+Graphs
+- Non-rectangular selections: Ctrl-click areas, L shapes, single columns.
+- ~/.config/tsheet/plot holds the gnuplot commands, one per line; edited by
+  hand or by Graph options, reread before every graph. Placeholders @SERIES,
+  @DATA, @N, @XNAME fill in the plot line.
+
 Export and import
 - Export: XLSX and ODS are in the Export menu.
 - File > Export options: delimiter (comma, semicolon, tab, pipe), CRLF line

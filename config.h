@@ -46,10 +46,14 @@ static const MenuItem export_menu[] = {
 /* Import: open files, and set how delimited text is read. */
 static const MenuItem import_menu[] = {
     {"Open...",             "Ctrl+O", A_OPEN,        NULL,
-     "open a file; text files with no known extension use the delimiter below"},
+     "open a file; .csv and other text files use the delimiter below (auto-detected by default)"},
     {"Find file...",        "Ctrl+F", A_FIND,        NULL,
      "search the current folder for a file by name, or by *.ext"},
     {"-",                   "",       0,             NULL, NULL},
+    {"Delimiter: auto-detect", "",    A_IMP_AUTO,    NULL,
+     "guess the delimiter from the text (tab, semicolon, pipe, comma or spaces); the default"},
+    {"Ask for delimiter on open", "", A_IMP_ASK,     NULL,
+     "with auto-detect, ask which delimiter to use when a delimited file opens; the detected one is highlighted; toggles"},
     {"Delimiter: comma",    "",       A_IMP_COMMA,   NULL,
      "read fields separated by commas, with quoted fields (RFC 4180)"},
     {"Delimiter: semicolon", "",      A_IMP_SEMI,    NULL,
@@ -60,6 +64,17 @@ static const MenuItem import_menu[] = {
      "read fields separated by |"},
     {"Delimiter: space",    "",       A_IMP_SPACE,   NULL,
      "read fields separated by runs of spaces; extra spaces and blank ends are ignored"},
+    {NULL}
+};
+
+/* The prompt shown when a delimited file opens (Import > Ask for delimiter).
+   The detected delimiter is highlighted; Enter opens, Esc cancels. */
+static const MenuItem open_delim_menu[] = {
+    {"Comma",               "",       A_IMP_COMMA,   NULL, NULL},
+    {"Semicolon",           "",       A_IMP_SEMI,    NULL, NULL},
+    {"Tab",                 "",       A_IMP_TAB,     NULL, NULL},
+    {"Pipe",                "",       A_IMP_PIPE,    NULL, NULL},
+    {"Space",               "",       A_IMP_SPACE,   NULL, NULL},
     {NULL}
 };
 
@@ -77,6 +92,11 @@ static const MenuItem paste_menu[] = {
     {"Keep formulas",       "",     A_PASTE_FORMULAS,   NULL, NULL},
     {"With formatting",     "",     A_PASTE_FMT,        NULL, NULL},
     {"Transpose",           "",     A_PASTE_TRANSPOSE,  NULL, NULL},
+    {"-",                   "",     0,                  NULL, NULL},
+    {"Delimited into rows", "",     A_PASTE_ROWS,       NULL,
+     "split clipboard text on its detected delimiter; each line fills a row, fields go right"},
+    {"Delimited into columns", "",  A_PASTE_COLS,       NULL,
+     "split clipboard text on its detected delimiter; each line fills a column, fields go down"},
     {NULL}
 };
 
@@ -123,7 +143,7 @@ static const MenuItem edit_menu[] = {
 /* Format > Numbers: how numbers are grouped or written. The applied style shows *. */
 static const MenuItem integer_menu[] = {
     {"Plain",               "",       A_INT_PLAIN,   NULL,
-     "numbers as they are typed, no grouping"},
+     "numbers as they are typed, no grouping; a Fortran 1.5D+03 shows as 1500"},
     {"Comma: 1,000",        "",       A_INT_COMMA,   NULL,
      "group the digits in threes with commas (1,234,567.5)"},
     {"Space: 1 000",        "",       A_INT_SPACE,   NULL,
@@ -132,6 +152,8 @@ static const MenuItem integer_menu[] = {
      "mantissa times a power of ten (1.234*10^3, 0.5*10^-3)"},
     {"Engineering: 1 k",    "",       A_INT_ENG,     NULL,
      "powers of a thousand with SI prefixes k to E (1.234 k); under 1000 shown plain"},
+    {"Fortran: 1.0D+03",    "",       A_INT_FORT,    NULL,
+     "Fortran double precision, D exponent (1.5D+03, -2.25D-04); Decimal places sets the mantissa digits"},
     {NULL}
 };
 
@@ -206,12 +228,17 @@ static const char *kind_fg[KIND_COUNT] = {
    below is a flag, an argument or a choice; the editor, the context menu and the
    command preview are all built from this table. Order matters: GO_* indexes it.
    Descriptions are taken from the gnuplot documentation (help text). */
-#define GRAPH_DEFAULTS "set key top right; set style data lines; set colorsequence classic"
+#define GRAPH_DEFAULTS "set key top right; set style data lines; set colorsequence classic; plot @SERIES"
 
 static const char *const legend_choices[] = {"top right", "top left", "bottom right",
     "bottom left", "outside", "off", NULL};
 static const char *const style_choices[]  = {"lines", "points", "linespoints", "boxes", NULL};
 static const char *const color_choices[]  = {"classic", "default", "podo", NULL};
+/* tick label formats offered for x format and y format (any other can be typed).
+   %t is the mantissa and %T the power of ten, so the first two are Fortran style. */
+#define FORTRAN_TICS "%.1tD%+03T"
+static const char *const tic_fmt_choices[] = {FORTRAN_TICS, "%.2tD%+03T", "%.1te%+03T",
+    "%g", "%.1f", "%.0f", NULL};
 
 enum { GO_LOGX, GO_LOGY, GO_GRID, GO_LEGEND, GO_STYLE, GO_FILL, GO_COLOR,
        GO_TITLE, GO_XLABEL, GO_YLABEL, GO_XRANGE, GO_YRANGE, GO_XTICS, GO_YTICS,
@@ -246,10 +273,10 @@ static const GraphOpt graph_opts[GO_COUNT] = {
      "Major tick marks on the x axis, e.g. 1, or auto."},
     {"y tics",         GO_ARG,    "set ytics %s", NULL, NULL,
      "Major tick marks on the y axis, e.g. 10, or auto."},
-    {"x format",       GO_ARG,    "set format x '%s'", NULL, NULL,
-     "printf-style format of the x tick labels, e.g. %.1f."},
-    {"y format",       GO_ARG,    "set format y '%s'", NULL, NULL,
-     "printf-style format of the y tick labels, e.g. %.1f."},
+    {"x format",       GO_ARG,    "set format x '%s'", NULL, tic_fmt_choices,
+     "printf-style format of the x tick labels, e.g. %.1f. " FORTRAN_TICS " gives Fortran style, 1.5D+03."},
+    {"y format",       GO_ARG,    "set format y '%s'", NULL, tic_fmt_choices,
+     "printf-style format of the y tick labels, e.g. %.1f. " FORTRAN_TICS " gives Fortran style, 1.5D+03."},
     {"point size",     GO_ARG,    "set pointsize %s", NULL, NULL,
      "Scale factor for point markers, e.g. 1.5."},
     {"box width",      GO_ARG,    "set boxwidth %s", NULL, NULL,
@@ -272,6 +299,10 @@ static const MenuItem graph_ctx[] = {
     {"Style: lines",        "",       A_GOPT_VAL + GO_STYLE * 32 + 0, NULL, NULL},
     {"Style: points",       "",       A_GOPT_VAL + GO_STYLE * 32 + 1, NULL, NULL},
     {"Style: boxes",        "",       A_GOPT_VAL + GO_STYLE * 32 + 3, NULL, NULL},
+    {"Fortran labels X",    "",       A_GOPT_VAL + GO_XFMT * 32 + 0,  NULL,
+     "x tick labels as Fortran doubles (1.5D+03); toggles"},
+    {"Fortran labels Y",    "",       A_GOPT_VAL + GO_YFMT * 32 + 0,  NULL,
+     "y tick labels as Fortran doubles (1.5D+03); toggles"},
     {"-",                   "",       0,                              NULL, NULL},
     {"All options...",      "",       A_GRAPH_OPTIONS,                NULL, NULL},
     {NULL}

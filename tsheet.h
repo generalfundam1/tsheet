@@ -58,6 +58,7 @@ typedef struct {
     char name[64];
     char *path;                 /* NULL until saved */
     int fmt;
+    int delim;                  /* CSV: the delimiter the file was read with (0: none) */
     Sheet *g;
     int cr, cc, ar, ac, sel_kind, top, left, dirty;
     int next;                   /* Ctrl+click areas: ext[0..next-1] */
@@ -101,6 +102,9 @@ typedef struct {
     int doc;                    /* sheet index the copy came from */
 } Clip;
 
+/* ---- a delimited file waiting for its delimiter (the open prompt) ---- */
+typedef struct { char *path; char *buf; size_t len; int det; } PendOpen;
+
 /* ---- input (term.c) ---- */
 enum {
     K_UP = 256, K_DOWN, K_LEFT, K_RIGHT, K_HOME, K_END, K_PGUP, K_PGDN, K_DEL, K_BTAB,
@@ -128,7 +132,8 @@ enum {
     A_XOPT_COMMA, A_XOPT_SEMI, A_XOPT_TAB, A_XOPT_PIPE, A_XOPT_CRLF,
     A_XOPT_SELONLY, A_XOPT_SHOW, A_IMP_COMMA, A_IMP_SEMI, A_IMP_TAB, A_IMP_PIPE,
     A_XOPT_SPACE, A_IMP_SPACE, A_GRAPH_VIEW, A_DLG_IMPORT, A_DLG_EXPORT, A_CONV_TO,
-    A_PREFIX, A_SUFFIX, A_INT_PLAIN, A_INT_COMMA, A_INT_SPACE, A_INT_SCI, A_INT_ENG
+    A_PREFIX, A_SUFFIX, A_INT_PLAIN, A_INT_COMMA, A_INT_SPACE, A_INT_SCI, A_INT_ENG,
+    A_IMP_AUTO, A_PASTE_ROWS, A_PASTE_COLS, A_IMP_ASK, A_INT_FORT
 };
 
 typedef struct MenuItem {
@@ -163,7 +168,7 @@ typedef struct {
     int mhov;                    /* menu bar title under the pointer, -1 if none */
     int warn;                    /* the status message is a warning: shown in red */
     int fref_pos, fref_len;      /* formula mode: where the last inserted reference is */
-    char gextra[1024];          /* graph settings: gnuplot commands, ';' separated */
+    char gextra[4096];          /* graph settings: gnuplot commands, ';' separated (mirrors ~/.config/tsheet/plot) */
     DlgItem dlg[24];
     int ndlg, dlg_kind, dlg_sel, dlg_top, dlg_opt;
     const MenuItem *acts;       /* non-NULL: the dialog lists these actions, not graph options */
@@ -179,7 +184,13 @@ typedef struct {
     int nlist, lsel, ltop, lkind;
     Clip clip;
     ExpOpt xo;                  /* export options */
-    int imp_delim;              /* delimiter for opening text files (0: comma) */
+    int imp_delim;              /* delimiter for opening text files (0: auto-detect) */
+    int imp_ask;                /* auto-detect: ask before opening, detected one highlighted */
+    PendOpen pend[64];          /* delimited files waiting for that answer */
+    int npend;
+    char pend_title[128];
+    char pend_desc[5][200];     /* how the first line splits with each delimiter */
+    int placeholder;            /* the start-up empty sheet, replaced by the first opened file; -1 */
     int quit;
 } App;
 
@@ -262,11 +273,14 @@ void        fmt_build(char *out, size_t n, int align, int bold, int hl, const ch
 
 /* ---- number formats (sheet.c). A numeric body is "n" + style + decimals + SEP +
    prefix + SEP + suffix + SEP. style: '-' plain, ',' 1,000, ' ' 1 000, 'e' 1*10^3,
-   'g' 1 k (engineering). decimals: '-' or a digit. ".N" is the older decimals-only
+   'g' 1 k (engineering), 'D' 1.0D+03 (Fortran double precision). decimals: '-' or a digit. ".N" is the older decimals-only
    body and still reads. */
 typedef struct { int style; int dec; char pre[64]; char suf[64]; } NumSpec;
 void        num_parse(const char *body, NumSpec *ns);
 void        num_build(char *out, size_t n, const NumSpec *ns);
+int         num_read(const char *text, double *out);   /* 1: a number, Fortran 1.5D+03 included */
+void        num_fit(char *text, size_t n, int w, double v);   /* a number's display text in w columns */
+int         num_fortran_fmt(const char *text, char *body, size_t n);   /* 1.5D+03: 1, body = Fortran format */
 /* units.c: unit conversions (the Convert menu) */
 int         units_find(const char *sym);            /* index of a unit symbol, -1 if unknown */
 const char *units_sym(int id);
@@ -292,6 +306,7 @@ int         io_read_fd(int fd, char **out, size_t *len);
 int         io_read_file(const char *path, char **out, size_t *len);
 int         io_fmt_from_path(const char *path);     /* -1 if unknown */
 int         io_fmt_from_text(const char *buf, size_t len);
+int         io_detect_delim(const char *buf, size_t len, int *sure);   /* ',' ';' '\t' '|' or ' ' */
 int         io_parse(Sheet *g, const char *buf, size_t len, int fmt, char *err, size_t errn);
 int         io_parse_delim(Sheet *g, const char *buf, size_t len, int fmt, int delim, char *err, size_t errn);
 /* read.c: xlsx and ods (zip files), first sheet only */
@@ -331,8 +346,11 @@ void        ui_list_geom(const App *a, int *x, int *y, int *w, int *h);
 void        ui_dlg_geom(const App *a, int *x, int *y, int *w, int *h);
 int         ui_dlg_list_rows(const App *a);
 /* ---- graph.c ---- */
-int         graph_draw(const Doc *d, int r1, int c1, int r2, int c2, const char *cmds,
+int         graph_draw(const Doc *d, const Rect *q, int nq, const char *cmds,
                        const char *base, char *pdf, size_t pdfn, char *msg, size_t msgn, int view);
+void        plot_file_path(char *out, size_t n);        /* ~/.config/tsheet/plot */
+int         plot_file_read(char *cmds, size_t n);       /* -1: no file */
+int         plot_file_write(const char *cmds);
 void        graph_open(const char *path);
 
 #endif
